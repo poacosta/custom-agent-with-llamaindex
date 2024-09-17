@@ -1,87 +1,19 @@
-from llama_index.llms.openai import OpenAI
+from typing import List, Dict, Any, Tuple
 
-llm = OpenAI(model="gpt-4o")
-
-from llama_index.core.tools import QueryEngineTool
-
-from sqlalchemy import (
-    create_engine,
-    MetaData,
-    Table,
-    Column,
-    String,
-    Integer,
-)
-from llama_index.core import SQLDatabase
-
-engine = create_engine("sqlite:///:memory:", future=True)
-metadata_obj = MetaData()
-# create city SQL table
-table_name = "city_stats"
-city_stats_table = Table(
-    table_name,
-    metadata_obj,
-    Column("city_name", String(16), primary_key=True),
-    Column("population", Integer),
-    Column("country", String(16), nullable=False),
-)
-
-metadata_obj.create_all(engine)
-
-from sqlalchemy import insert
-
-rows = [
-    {"city_name": "Toronto", "population": 2930000, "country": "Canada"},
-    {"city_name": "Tokyo", "population": 13960000, "country": "Japan"},
-    {"city_name": "Berlin", "population": 3645000, "country": "Germany"},
-]
-for row in rows:
-    stmt = insert(city_stats_table).values(**row)
-    with engine.begin() as connection:
-        cursor = connection.execute(stmt)
-
-from llama_index.core.query_engine import NLSQLTableQueryEngine
-
-sql_database = SQLDatabase(engine, include_tables=["city_stats"])
-sql_query_engine = NLSQLTableQueryEngine(
-    sql_database=sql_database, tables=["city_stats"], verbose=True, llm=llm
-)
-sql_tool = QueryEngineTool.from_defaults(
-    query_engine=sql_query_engine,
-    description=(
-        "Useful for translating a natural language query into a SQL query over"
-        " a table containing: city_stats, containing the population/country of"
-        " each city"
-    ),
-)
-
-from llama_index.readers.wikipedia import WikipediaReader
-from llama_index.core import VectorStoreIndex
-
-cities = ["Toronto", "Berlin", "Tokyo"]
-wiki_docs = WikipediaReader().load_data(pages=cities)
-
-# build a separate vector index per city
-# You could also choose to define a single vector index across all docs, and annotate each chunk by metadata
-vector_tools = []
-for city, wiki_doc in zip(cities, wiki_docs):
-    vector_index = VectorStoreIndex.from_documents([wiki_doc])
-    vector_query_engine = vector_index.as_query_engine()
-    vector_tool = QueryEngineTool.from_defaults(
-        query_engine=vector_query_engine,
-        description=f"Useful for answering semantic questions about {city}",
-    )
-    vector_tools.append(vector_tool)
-
-from typing import Dict, Any, Tuple
-from llama_index.core.program import FunctionCallingProgram
-from llama_index.core.query_engine import RouterQueryEngine
 from llama_index.core import ChatPromptTemplate
-from llama_index.core.selectors import PydanticSingleSelector
+from llama_index.core import VectorStoreIndex, SQLDatabase
+from llama_index.core.agent import FnAgentWorker
 from llama_index.core.bridge.pydantic import Field, BaseModel
-
 from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core.program import FunctionCallingProgram
+from llama_index.core.query_engine import NLSQLTableQueryEngine, RouterQueryEngine
+from llama_index.core.selectors import PydanticSingleSelector
+from llama_index.core.tools import QueryEngineTool
+from llama_index.llms.openai import OpenAI
+from llama_index.readers.wikipedia import WikipediaReader
+from sqlalchemy import create_engine, MetaData, Table, Column, String, Integer, insert
 
+# Constants
 DEFAULT_PROMPT_STR = """
 Given previous question/response pairs, please determine if an error has occurred in the response, and suggest \
     a modified question that will not trigger the error.
@@ -94,121 +26,185 @@ Examples of modified questions:
 An error means that either an exception has triggered, or the response is completely irrelevant to the question.
 
 Please return the evaluation of the response in the following JSON format.
-
 """
 
+MODEL = "gpt-4o"
 
-def get_chat_prompt_template(
-        system_prompt: str, current_reasoning: Tuple[str, str]
-) -> ChatPromptTemplate:
-    system_msg = ChatMessage(role=MessageRole.SYSTEM, content=system_prompt)
-    messages = [system_msg]
-    for raw_msg in current_reasoning:
-        if raw_msg[0] == "user":
-            messages.append(
-                ChatMessage(role=MessageRole.USER, content=raw_msg[1])
-            )
-        else:
-            messages.append(
-                ChatMessage(role=MessageRole.ASSISTANT, content=raw_msg[1])
-            )
-    return ChatPromptTemplate(message_templates=messages)
+CITIES = ["La Habana", "Monterrey", "Málaga"]
+
+CITIES_DATA = [
+    {"city_name": "La Habana", "population": 2106657, "country": "Cuba"},
+    {"city_name": "Monterrey", "population": 5339425, "country": "Mexico"},
+    {"city_name": "Málaga", "population": 570000, "country": "Spain"},
+]
+
+
+class CityDatabase:
+    """Manages the SQLite database for storing city information."""
+
+    def __init__(self):
+        # Create an in-memory SQLite database
+        self.engine = create_engine("sqlite:///:memory:", future=True)
+        self.metadata = MetaData()
+        self.table = self._create_table()
+        self.metadata.create_all(self.engine)
+
+    def _create_table(self):
+        """Create the city_stats table schema."""
+        return Table(
+            "city_stats",
+            self.metadata,
+            Column("city_name", String(16), primary_key=True),
+            Column("population", Integer),
+            Column("country", String(16), nullable=False),
+        )
+
+    def insert_data(self, rows: List[Dict[str, Any]]):
+        """Insert multiple rows of data into the city_stats table."""
+        for row in rows:
+            stmt = insert(self.table).values(**row)
+            with self.engine.begin() as connection:
+                connection.execute(stmt)
 
 
 class ResponseEval(BaseModel):
-    """Evaluation of whether the response has an error."""
+    """Pydantic model for evaluating responses and suggesting new questions."""
 
-    has_error: bool = Field(
-        ..., description="Whether the response has an error."
-    )
+    has_error: bool = Field(..., description="Whether the response has an error.")
     new_question: str = Field(..., description="The suggested new question.")
-    explanation: str = Field(
-        ...,
-        description=(
-            "The explanation for the error as well as for the new question."
-            "Can include the direct stack trace as well."
-        ),
-    )
+    explanation: str = Field(..., description="The explanation for the error and the new question.")
 
 
-def retry_agent_fn(state: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
-    """Retry agent.
+class CityQuerySystem:
+    """Main class for handling city queries using SQL and vector databases."""
 
-    Runs a single step.
+    def __init__(self, llm: OpenAI):
+        self.llm = llm
+        self.db = CityDatabase()
+        self.sql_tool = self._create_sql_tool()
+        self.vector_tools = self._create_vector_tools()
+        self.router_query_engine = self._create_router_query_engine()
 
-    Returns:
-        Tuple of (agent_response, is_done)
+    def _create_sql_tool(self):
+        """Create an SQL query tool for the city_stats table."""
+        sql_database = SQLDatabase(self.db.engine, include_tables=["city_stats"])
+        sql_query_engine = NLSQLTableQueryEngine(
+            sql_database=sql_database, tables=["city_stats"], verbose=True, llm=self.llm
+        )
+        return QueryEngineTool.from_defaults(
+            query_engine=sql_query_engine,
+            description="Useful for translating a natural language query into a SQL query over a table containing: city_stats, containing the population/country of each city"
+        )
 
-    """
-    task, router_query_engine = state["__task__"], state["router_query_engine"]
-    llm, prompt_str = state["llm"], state["prompt_str"]
-    verbose = state.get("verbose", False)
+    @staticmethod
+    def _create_vector_tools():
+        """Create vector tools for semantic queries about specific cities."""
 
-    if "new_input" not in state:
-        new_input = task.input
-    else:
-        new_input = state["new_input"]
+        # Load Wikipedia data for the specified cities
+        wiki_docs = WikipediaReader().load_data(pages=CITIES)
 
-    # first run router query engine
-    response = router_query_engine.query(new_input)
+        vector_tools = []
+        for city, wiki_doc in zip(CITIES, wiki_docs):
+            vector_index = VectorStoreIndex.from_documents([wiki_doc])
+            vector_query_engine = vector_index.as_query_engine()
+            vector_tool = QueryEngineTool.from_defaults(
+                query_engine=vector_query_engine,
+                description=f"Useful for answering semantic questions about {city}"
+            )
+            vector_tools.append(vector_tool)
+        return vector_tools
 
-    # append to current reasoning
-    state["current_reasoning"].extend(
-        [("user", new_input), ("assistant", str(response))]
-    )
+    def _create_router_query_engine(self):
+        """Create a router query engine to select between SQL and vector tools."""
+        return RouterQueryEngine(
+            selector=PydanticSingleSelector.from_defaults(llm=self.llm),
+            query_engine_tools=[self.sql_tool] + self.vector_tools,
+            verbose=True,
+        )
 
-    # Then, check for errors
-    # dynamically create pydantic program for structured output extraction based on template
-    chat_prompt_tmpl = get_chat_prompt_template(
-        prompt_str, state["current_reasoning"]
-    )
-    llm_program = FunctionCallingProgram.from_defaults(
-        output_cls=ResponseEval,
-        prompt=chat_prompt_tmpl,
-        llm=llm,
-    )
-    # run program, look at the result
-    response_eval = llm_program(
-        query_str=new_input, response_str=str(response)
-    )
-    if not response_eval.has_error:
-        is_done = True
-    else:
-        is_done = False
-    state["new_input"] = response_eval.new_question
+    @staticmethod
+    def get_chat_prompt_template(system_prompt: str, current_reasoning: List[Tuple[str, str]]) -> ChatPromptTemplate:
+        """Create a chat prompt template based on the system prompt and current reasoning."""
+        system_msg = ChatMessage(role=MessageRole.SYSTEM, content=system_prompt)
+        messages = [system_msg]
+        for role, content in current_reasoning:
+            messages.append(
+                ChatMessage(role=MessageRole.USER if role == "user" else MessageRole.ASSISTANT, content=content))
+        return ChatPromptTemplate(message_templates=messages)
 
-    if verbose:
-        print(f"> Question: {new_input}")
-        print(f"> Response: {response}")
-        print(f"> Response eval: {response_eval.model_dump()}")
+    def retry_agent_fn(self, state: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+        """Function for the retry agent to process queries and evaluate responses."""
+        task, router_query_engine = state["__task__"], self.router_query_engine
+        prompt_str = state["prompt_str"]
+        verbose = state.get("verbose", False)
 
-    # set output
-    state["__output__"] = str(response)
+        new_input = state.get("new_input", task.input)
+        response = router_query_engine.query(new_input)
 
-    # return response
-    return state, is_done
+        state["current_reasoning"].extend([("user", new_input), ("assistant", str(response))])
+
+        # Create a chat prompt template and LLM program for response evaluation
+        chat_prompt_tmpl = self.get_chat_prompt_template(prompt_str, state["current_reasoning"])
+        llm_program = FunctionCallingProgram.from_defaults(
+            output_cls=ResponseEval,
+            prompt=chat_prompt_tmpl,
+            llm=self.llm,
+        )
+
+        # Evaluate the response and determine if a retry is necessary
+        response_eval = llm_program(query_str=new_input, response_str=str(response))
+        is_done = not response_eval.has_error
+        state["new_input"] = response_eval.new_question
+
+        if verbose:
+            print(f"> Question: {new_input}")
+            print(f"> Response: {response}")
+            print(f"> Response eval: {response_eval.model_dump()}")
+
+        state["__output__"] = str(response)
+        return state, is_done
+
+    def create_agent(self):
+        """Create an agent worker for handling city queries."""
+        return FnAgentWorker(
+            fn=self.retry_agent_fn,
+            initial_state={
+                "prompt_str": DEFAULT_PROMPT_STR,
+                "llm": self.llm,
+                "router_query_engine": self.router_query_engine,
+                "current_reasoning": [],
+                "verbose": True,
+            },
+        ).as_agent()
 
 
-from llama_index.llms.openai import OpenAI
-from llama_index.core.agent import FnAgentWorker
+def main():
+    """Main function to run the interactive City Query System."""
+    print("Initializing City Query System...")
+    llm = OpenAI(model=MODEL)
+    city_query_system = CityQuerySystem(llm)
 
-llm = OpenAI(model="gpt-4o")
-router_query_engine = RouterQueryEngine(
-    selector=PydanticSingleSelector.from_defaults(llm=llm),
-    query_engine_tools=[sql_tool] + vector_tools,
-    verbose=True,
-)
-agent = FnAgentWorker(
-    fn=retry_agent_fn,
-    initial_state={
-        "prompt_str": DEFAULT_PROMPT_STR,
-        "llm": llm,
-        "router_query_engine": router_query_engine,
-        "current_reasoning": [],
-        "verbose": True,
-    },
-).as_agent()
+    # Insert sample data into the city_stats table
+    city_query_system.db.insert_data(CITIES_DATA)
+
+    # Create an agent for handling queries
+    agent = city_query_system.create_agent()
+
+    print("City Query System is ready. You can start asking questions.")
+    print("Type 'exit' or press Ctrl+C to end the session.")
+
+    try:
+        while True:
+            user_input = input("\nEnter your question: ")
+            if user_input.lower() == 'exit':
+                break
+
+            response = agent.chat(user_input)
+            print("\nResponse:", str(response))
+
+    except KeyboardInterrupt:
+        print("\nExiting the City Query System. Goodbye!")
+
 
 if __name__ == "__main__":
-    response = agent.chat("Which countries are each city from?")
-    print(str(response))
+    main()

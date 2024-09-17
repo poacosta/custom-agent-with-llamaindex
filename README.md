@@ -4,9 +4,9 @@
 
 > By themselves, language models can't take actions — they just output text.
 > Agents are systems that use LLMs as reasoning engines to determine which actions to take and the inputs to pass
-> them. After executing actions, the results can be fed back into the LLM to determine whether more actions are needed,
-> or
-> whether it is okay to finish.
+> them.
+> After executing actions, the results can be fed back into the LLM to determine whether more actions are necessary,
+> or whether it is okay to finish.
 
 ## What does this Agent do?
 
@@ -21,7 +21,7 @@ You need to have the following installed on your machine:
 - [Virtualenv](https://pypi.org/project/virtualenv/)
 
 ```bash
-# LlamaIndex Llms Integration: Openai
+# LlamaIndex LLMs Integration: Openai
 pip install llama-index-llms-openai
 
 # LlamaIndex Embeddings Integration: Openai
@@ -39,6 +39,8 @@ pip install llama-index-readers-wikipedia
 ```
 
 ## How to use the Agent
+
+### Running the Agent
 
 ```bash
 # Clone the repository
@@ -59,6 +61,35 @@ pip install -r requirements.txt
 # Run the agent
 python main.py
 ```
+
+Make sure to set your OpenAI key before running: `export OPENAI_API_KEY-="sk-..."`
+
+### Querying the Agent
+
+Once the agent is running, you can add a query to the agent by typing it in the terminal.
+
+If the terminal is ready will show the following message:
+
+```bash
+Initializing City Query System...
+City Query System is ready. You can start asking questions.
+Type 'exit' or press Ctrl+C to end the session.
+
+Enter your question: 
+```
+
+Add your query and press `Enter`.
+
+For example, you can ask the agent:
+
+```bash
+Which countries are each city from?
+```
+
+Have in mind that the agent will primarily provide information based on the data it has access to,
+will extract context data from Wikipedia, and will use the LLM to generate a response and evaluate it.
+
+See the Constants section in code to know the loaded info.
 
 ## Related Docs
 
