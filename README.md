@@ -10,6 +10,8 @@
 
 ## What does this Agent do?
 
+Using predefined data of some cities (in the constants section of the code), the agent could be queried about these cities and will primarily provide information based on the data it has access to, extract contextual data from Wikipedia, and use the LLM to generate a response and evaluate it.
+
 ## Getting Started
 
 ### Prerequisites
